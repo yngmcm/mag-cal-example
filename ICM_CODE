@@ -1,0 +1,117 @@
+#include <Wire.h>
+#include <ICM_20948.h>
+#include <SPI.h>
+#include <SD.h>
+#include <BasicLinearAlgebra.h>
+using namespace BLA;
+
+ICM_20948_I2C myICM; // ICM object
+File dataFile;
+
+#define pi 3.14159f
+#define convert_rad (pi / 180.0f)
+#define convert_G 9.81f
+
+// Sensor data
+float ax, ay, az, gx, gy, gz;
+
+// Calibrated raw vectors
+BLA::Vector<3> f_raw, w_raw;
+BLA::Vector<3> f_cal, w_cal;
+
+// Calibration matrices (example values — replace with actual calibration)
+BLA::Matrix<3, 3> A = {
+  1.0f, 0.0f, 0.0f,
+  0.0f, 1.0f, 0.0f,
+  0.0f, 0.0f, 1.0f
+};
+BLA::Vector<3> b = { 0.0f, 0.0f, 0.0f };
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  // ICM init
+  myICM.begin(Wire, 0x68);
+  if (myICM.status != ICM_20948_Stat_Ok) {
+    Serial.println("ICM-20948 not found.");
+    while (1);
+  }
+
+  // Set sample rate
+  ICM_20948_smplrt_t mySmplrt;
+  mySmplrt.a = 8;
+  mySmplrt.g = 8;
+  myICM.setSampleRate((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), mySmplrt);
+
+  // Enable SD card
+  if (!SD.begin(BUILTIN_SDCARD)) {
+    Serial.println("SD card initialization failed!");
+    while (1);
+  }
+
+  dataFile = SD.open("data.txt", FILE_WRITE);
+  if (!dataFile) {
+    Serial.println("Failed to open file");
+    while (1);
+  }
+
+  dataFile.println("ax,ay,az,gx,gy,gz,f1,f2,f3,w1,w2,w3");
+  dataFile.flush();
+
+  Serial.println("Setup complete.");
+}
+
+void loop() {
+  if (myICM.dataReady()) {
+    myICM.getAGMT();
+
+    // Raw sensor readings
+    ax = myICM.accX();
+    ay = myICM.accY();
+    az = myICM.accZ();
+    gx = myICM.gyrX();
+    gy = myICM.gyrY();
+    gz = myICM.gyrZ();
+
+    // Convert raw to proper units
+    f_raw = { ax * convert_G, ay * convert_G, az * convert_G };
+    w_raw = { gx * convert_rad, gy * convert_rad, gz * convert_rad };
+
+    // Apply calibration
+    f_cal = A * (f_raw - b);
+    w_cal = A * (w_raw - b);
+
+    // Output
+    Serial.print("Accel (m/s^2): ");
+    Serial.print(f_cal(0)); Serial.print(", ");
+    Serial.print(f_cal(1)); Serial.print(", ");
+    Serial.println(f_cal(2));
+
+    Serial.print("Gyro (rad/s): ");
+    Serial.print(w_cal(0)); Serial.print(", ");
+    Serial.print(w_cal(1)); Serial.print(", ");
+    Serial.println(w_cal(2));
+
+    // Save to SD
+    dataFile.print(ax); dataFile.print(",");
+    dataFile.print(ay); dataFile.print(",");
+    dataFile.print(az); dataFile.print(",");
+    dataFile.print(gx); dataFile.print(",");
+    dataFile.print(gy); dataFile.print(",");
+    dataFile.print(gz); dataFile.print(",");
+    dataFile.print(f_cal(0)); dataFile.print(",");
+    dataFile.print(f_cal(1)); dataFile.print(",");
+    dataFile.print(f_cal(2)); dataFile.print(",");
+    dataFile.print(w_cal(0)); dataFile.print(",");
+    dataFile.print(w_cal(1)); dataFile.print(",");
+    dataFile.println(w_cal(2));
+
+    dataFile.flush();
+  }
+
+  delay(10); // adjust sampling delay as needed
+}
