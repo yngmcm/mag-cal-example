@@ -1,0 +1,622 @@
+#include <_Teensy.h>
+
+
+#include <Wire.h>
+#include <BasicLinearAlgebra.h>
+
+#include "SparkFun_ISM330DHCX.h"
+#include <SparkFun_MMC5983MA_Arduino_Library.h>
+#include <SD.h>
+#define convert_G 9.81
+#define pi 3.14159
+#define convert_dps (180.0/pi)
+#define convert_rad (pi/180.0)
+
+
+
+const int chipselect = BUILTIN_SDCARD ;
+
+sfe_ism_data_t accelData;
+sfe_ism_data_t gyroData;
+
+//magnetometer
+uint32_t currentX = 0;
+uint32_t currentY = 0;
+uint32_t currentZ = 0;
+double scaledX = 0;
+double scaledY = 0;
+double scaledZ = 0;
+float wx_ = 0,wy_ = 0,wz_ = 0;
+float fx_ = 0,fy_ = 0,fz_ = 0;
+float hx_ = 0,hy_ = 0,hz_ = 0;
+bool initialized = false;
+float tnow,tprev,dt;
+bool gyroUpdated_, accelUpdated_, magUpdated_;
+bool timeLatch = false;
+uint32_t startingTime;
+uint32_t duration = 120*1000*1000;
+uint32_t gyroCount, accelCount, magCount, quatCount;
+float Sa_x = -0.00849136, Sa_y = 0.00082995, Sa_z = -0.00335155;
+float Na_x = 0.0025984, Na_y = -0.000653, Na_z = -0.00037054;
+float Ba_x = 0.08555739, Ba_y = -0.21964094, Ba_z = 0.08952941;
+float Sw_x = -0.11, Sw_y = -0.11, Sw_z = -0.11;
+float Nw_x = -0.08446733, Nw_y = -0.10999942, Nw_z = -0.1099999;
+float Bw_x = -0.06099796/convert_dps, Bw_y = -0.05164723/convert_dps, Bw_z = 0.11/convert_dps;
+float Ex = 0.1183506, Ey = -0.02341486, Ez = -0.04149639;
+float Sh_x = 1.779198, Sh_y = 2.610555, Sh_z = 2.431528;
+float Nh_2 = -0.000971, Nh_3 = -0.000222, Nh_6 = -0.010973;
+float Bh_x = -65.084969, Bh_y = 0.833134, Bh_z = 1.835437; 
+
+SparkFun_ISM330DHCX myISM;
+SFE_MMC5983MA myMag;
+unsigned long tstart, tstop;
+
+using namespace BLA;
+//Declare 3x3 matrix for acceleration
+BLA::Matrix<3, 1> f_raw;    //acceleration
+BLA::Matrix<3, 3> Ma;   //scale factor,misalignment
+BLA::Matrix<3, 1> ba;   //accelerometer bias
+BLA::Matrix<3, 1> w_raw;    //angular rate
+BLA::Matrix<3, 3> Mw;   //scale facor, misalignment
+BLA::Matrix<3, 1> bw;   //gyroscope bias
+BLA::Matrix<3, 3> I;  //Identity Matrix
+BLA::Matrix<3, 3> E;  //skew matrix
+BLA::Matrix<3, 3> Rm;
+BLA::Matrix<3, 1> h_raw; //magnetometer raw data
+BLA::Matrix<3, 1> bh;  //magnetometer bias
+BLA::Matrix<3, 3> A;   //magnetometer error matrix
+
+//
+BLA::Matrix<3, 1> gyroBias;
+BLA::Matrix<3, 1> gyroVariance;
+BLA::Matrix<3, 1> gyroDelta;
+BLA::Matrix<3, 1> gyroDelta2;
+BLA::Matrix<3, 1> gyroM2;
+BLA::Matrix<3, 1> accelMean;
+BLA::Matrix<3, 1> accelVariance;
+BLA::Matrix<3, 1> accelDelta;
+BLA::Matrix<3, 1> accelDelta2;
+BLA::Matrix<3, 1> accelM2;
+BLA::Matrix<3, 1> magMean;
+BLA::Matrix<3, 1> magVariance;
+BLA::Matrix<3, 1> magDelta;
+BLA::Matrix<3, 1> magDelta2;
+BLA::Matrix<3, 1> magM2;
+BLA::Matrix<4, 1> quatMean;
+BLA::Matrix<4, 1> quatVariance;
+BLA::Matrix<4, 1> quatDelta;
+BLA::Matrix<4, 1> quatDelta2;
+BLA::Matrix<4, 1> quatM2;
+BLA::Matrix<3, 1> initialEuler;
+BLA::Matrix<3, 1> accel;
+BLA::Matrix<3, 1> mag;
+BLA::Matrix<3, 1> Euler;
+BLA::Matrix<4, 1> Quat;
+float phi, theta;
+//kalman filter time update
+BLA::Matrix<7, 1> x_;  //state matrix
+BLA::Matrix<7, 7> F_;  //state transition matrix
+BLA::Matrix<7, 7> P_;  //state covariance matrix
+BLA::Matrix<3, 3> Q_;  //gyro covariance matrix
+BLA::Matrix<7, 3> L_;  //process noise matrix 
+//kalman filter accel and mag measurement update
+BLA::Matrix<4, 7> H_;  //measurement jacobian
+BLA::Matrix<6, 6> R_; //measurement covariance matrix
+BLA::Matrix<4, 6> M_; //measurement output matrix
+BLA::Matrix<7, 4> K_; //Kalman gain matrix
+BLA::Matrix<4, 1> h_; //estimated output matrix
+BLA::Matrix<4, 1> y_; //measurement output
+//accel only measurement update
+BLA::Matrix<3, 7> Ha_;  //measurement jacobian
+BLA::Matrix<3, 3> Ra_;  //measurement covariance matrix
+BLA::Matrix<3, 3> Ma_;  //measurement output matrix
+BLA::Matrix<7, 3> Ka_;  //Kalman gain
+BLA::Matrix<3, 1> ha_;  //estimated output
+BLA::Matrix<3, 1> ya_;  //measured output;
+
+BLA::Matrix<7, 7> I_;   //Identity Matrix
+
+void ScaledMag()
+{
+  currentX = myMag.getMeasurementX();
+  currentY = myMag.getMeasurementY();
+  currentZ = myMag.getMeasurementZ();
+  scaledX = (double)currentX - 131072.0;
+  scaledX /= 131072.0;
+  scaledY = (double)currentY - 131072.0;
+  scaledY /= 131072.0;
+  scaledZ = (double)currentZ - 131072.0;
+  scaledZ /= 131072.0;
+}
+
+ void ISM_setup(){
+  ba(0,0) = Ba_x;
+  ba(1,0) = Ba_y;
+  ba(2,0) = Ba_z;
+  Ma.Fill(0);             //initialized 
+  Mw.Fill(0);           //initialized
+  I.Fill(0);
+  I(0,0) = 1;
+  I(1,1) = 1;
+  I(2,2) = 1;
+  Ma(0,0) = Sa_x;
+  Ma(0,1) = Na_y;
+  Ma(0,2) = Na_z;
+  Ma(1,1) = Sa_y;
+  Ma(1,2) = Na_x;
+  Ma(2,2) = Sa_z;
+  Mw(0,0) = Sw_x;
+  Mw(0,1) = Nw_y;
+  Mw(0,2) = Nw_z;
+  Mw(1,1) = Sw_y;
+  Mw(1,2) = Nw_x;
+  Mw(2,2) = Sw_z;
+  bw(0,0) = Bw_x;
+  bw(1,0) = Bw_y;
+  bw(2,0) = Bw_z;
+  E.Fill(0);
+  E(0,1) = -Ez;
+  E(0,2) = Ey;
+  E(1,0) = Ez;
+  E(1,2) = -Ex;
+  E(2,0) = -Ey;
+  E(2,1) = Ex; 
+  Rm = I + E;
+
+  bh(0,0) = Bh_x;
+  bh(1,0) = Bh_y;
+  bh(2,0) = Bh_z;
+  A(0,0) = Sh_x;
+  A(0,1) = Nh_2;
+  A(0,2) = Nh_3;
+  A(1,0) = Nh_2;
+  A(1,1) = Sh_y;
+  A(1,2) = Nh_6;
+  A(2,0) = Nh_3;
+  A(2,1) = Nh_6;
+  A(2,2) = Sh_z;
+ }
+
+ void ISM_calib(){
+    myISM.getAccel(&accelData);
+    myISM.getGyro(&gyroData);
+    ScaledMag();
+
+    f_raw(0,0) = (accelData.xData*convert_G)/1000;    w_raw(0,0) = (gyroData.xData*convert_rad)/1000;  h_raw(0,0) = scaledX*8*100;  
+    f_raw(1,0) = (accelData.yData*convert_G)/1000;    w_raw(1,0) = (gyroData.yData*convert_rad)/1000;  h_raw(1,0) = scaledY*8*100;
+    f_raw(2,0) = (accelData.zData*convert_G)/1000;    w_raw(2,0) = (gyroData.zData*convert_rad)/1000;  h_raw(2,0) = scaledZ*8*100;
+
+ }
+ void normalize(BLA::Matrix<3, 1>& V){
+   float norm = sqrt(V(0,0)*V(0,0)+V(1,0)*V(1,0)+V(2,0)*V(2,0));
+   V(0,0) /= norm;
+   V(1,0) /= norm;
+   V(2,0) /= norm;
+ }
+  void normalized(BLA::Matrix<4, 1>& V){
+   float norm = sqrt(V(0,0)*V(0,0)+V(1,0)*V(1,0)+V(2,0)*V(2,0));
+   V(0,0) /= norm;
+   V(1,0) /= norm;
+   V(2,0) /= norm;
+ }
+BLA::Matrix<4, 1> Eul2Quat(BLA::Matrix<3, 1> eul) {
+  BLA::Matrix<4, 1> q;
+  q(0, 0) = cos(eul(2, 0) / 2.0) * cos(eul(1, 0) / 2.0) * cos(eul(0, 0) / 2.0) + sin(eul(2, 0) / 2.0) * sin(eul(1, 0) / 2.0) * sin(eul(0, 0) / 2.0);
+  q(1, 0) = cos(eul(2, 0) / 2.0) * cos(eul(1, 0) / 2.0) * sin(eul(0, 0) / 2.0) - sin(eul(2, 0) / 2.0) * sin(eul(1, 0) / 2.0) * cos(eul(0, 0) / 2.0);
+  q(2, 0) = cos(eul(2, 0) / 2.0) * sin(eul(1, 0) / 2.0) * cos(eul(0, 0) / 2.0) + sin(eul(2, 0) / 2.0) * cos(eul(1, 0) / 2.0) * sin(eul(0, 0) / 2.0);
+  q(3, 0) = sin(eul(2, 0) / 2.0) * cos(eul(1, 0) / 2.0) * cos(eul(0, 0) / 2.0) - cos(eul(2, 0) / 2.0) * sin(eul(1, 0) / 2.0) * sin(eul(0, 0) / 2.0);
+  return q;
+}
+
+BLA::Matrix<3, 1> Quat2Eul(BLA::Matrix<4, 1> q) {
+  BLA::Matrix<3, 1> eul;
+  eul(0, 0) = atan2(2.0 * q(2, 0) * q(3, 0) + 2.0 * q(0, 0) * q(1, 0), 2.0 * q(0, 0) * q(0, 0) + 2.0 * q(3, 0) * q(3, 0) - 1.0);
+  eul(1, 0) = asin(-2.0 * q(1, 0) * q(3, 0) + 2.0 * q(0, 0) * q(2, 0));
+  eul(2, 0) = atan2(2.0 * q(1, 0) * q(2, 0) + 2.0 * q(0, 0) * q(3, 0), 2.0 * q(0, 0) * q(0, 0) + 2.0 * q(1, 0) * q(1, 0) - 1.0);
+  return eul;
+}
+
+template <int Rows, int Cols>
+BLA::Matrix<Cols, Rows> transposeMatrix(const BLA::Matrix<Rows, Cols>& matrix) {
+  BLA::Matrix<Cols, Rows> transposed;
+  for (int i = 0; i < Rows; i++) {
+    for (int j = 0; j < Cols; j++) {
+      transposed(j, i) = matrix(i, j);
+    }
+  }
+  return transposed;
+}
+
+ void kalman_filter(float wx,float wy, float wz, float fx, float fy, float fz, float hx, float hy, float hz){
+
+   //check for new data
+   if((wx!=wx_)||(wy!=wy_)||(wz!=wz_)){
+     gyroUpdated_ = true;
+     wx_ = wx;
+     wy_ = wy;
+     wz_ = wz;
+
+   } else {
+     gyroUpdated_ = false;
+   }
+   if((fx!=fx_)||(fy!=fy_)||(fz!=fz_)){
+     accelUpdated_ = true;
+     fx_ = fx;
+     fy_ = fy;
+     fz_ = fz;
+   } else {
+     accelUpdated_ = false;
+   }
+   if((hx!=hx_)||(hy!=hy_)||(hz!=hz_)){
+     magUpdated_ = true;
+     hx_ = hx;
+     hy_ = hy;
+     hz_ = hz;
+   }else{
+     magUpdated_ = false;
+   }
+   if (!initialized){
+     if(!timeLatch){
+       startingTime = micros();
+       timeLatch = true;
+     }
+     if ((micros()- startingTime) < duration){
+       if (gyroUpdated_) {
+         gyroCount++;
+         gyroDelta(0,0) = wx - gyroBias(0,0);
+         gyroBias(0,0) = gyroBias(0,0) + gyroDelta(0,0)/((float) (gyroCount));
+         gyroDelta2(0,0) = wx - gyroBias(0,0);
+         gyroM2(0,0) = gyroM2(0,0) + gyroDelta(0,0)*gyroDelta2(0,0);
+         gyroDelta(1,0) = wy - gyroBias(1,0);
+         gyroBias(1,0) = gyroBias(1,0) + gyroDelta(1,0)/((float) (gyroCount));
+         gyroDelta2(1,0) = wy - gyroBias(1,0);
+         gyroM2(1,0) = gyroM2(1,0) + gyroDelta(1,0)*gyroDelta2(1,0);
+         gyroDelta(2,0) = wz - gyroBias(2,0);
+         gyroBias(2,0) = gyroBias(2,0) + gyroDelta(2,0)/((float) (gyroCount));
+         gyroDelta2(2,0) = wz - gyroBias(2,0);
+         gyroM2(2,0) = gyroM2(2,0) + gyroDelta(2,0)*gyroDelta2(2,0);
+         if (gyroCount > 2) {
+           gyroVariance(0,0) = gyroM2(0,0)/((float) (gyroCount-1));
+           gyroVariance(1,0) = gyroM2(1,0)/((float) (gyroCount-1));
+           gyroVariance(2,0) = gyroM2(2,0)/((float) (gyroCount-1));
+         }
+       }
+       if (accelUpdated_){
+         accelCount++;
+         accelDelta(0,0) = fx - accelMean(0,0);
+         accelMean(0,0) = accelMean(0,0) + accelDelta(0,0)/((float) (accelCount));
+         accelDelta2(0,0) = fx - accelMean(0,0);
+         accelM2(0,0) = accelM2(0,0) + accelDelta(0,0)*accelDelta2(0,0);
+         accelDelta(1,0) = fy - accelMean(1,0);
+         accelMean(1,0) = accelMean(1,0) + accelDelta(1,0)/((float) (accelCount));
+         accelDelta2(1,0) = fy - accelMean(1,0);
+         accelM2(1,0) = accelM2(1,0) + accelDelta(1,0)*accelDelta2(1,0);
+         accelDelta(2,0) = fz - accelMean(2,0);
+         accelMean(2,0) = accelMean(2,0) + accelDelta(2,0)/((float) (accelCount));
+         accelDelta2(2,0) = fz - accelMean(2,0);
+         accelM2(2,0) = accelM2(2,0) + accelDelta(2,0)*accelDelta2(2,0);
+         if (accelCount > 2){
+           accelVariance(0,0) = accelM2(0,0)/((float) (accelCount-1));
+           accelVariance(1,0) = accelM2(1,0)/((float) (accelCount-1));
+           accelVariance(2,0) = accelM2(2,0)/((float) (accelCount-1));
+         }
+       }
+       if (magUpdated_){
+         magCount++;
+         magDelta(0,0) = hx - magMean(0,0);
+         magMean(0,0) = magMean(0,0) + magDelta(0,0)/((float) (magCount));
+         magDelta2(0,0) = hx - magMean(0,0);
+         magM2(0,0) = magM2(0,0) + magDelta(0,0) * magDelta2(0,0);
+         magDelta(1,0) = hy - magMean(1,0);
+         magMean(1,0) = magMean(1,0) + magDelta(1,0)/((float) (magCount));
+         magDelta2(1,0) = hy - magMean(1,0);
+         magM2(1,0) = magM2(1,0) + magDelta(1,0) * magDelta2(1,0);
+         magDelta(2,0) = hz - magMean(2,0);
+         magMean(2,0) = magMean(2,0) + magDelta(2,0)/((float) (magCount));
+         magDelta2(2,0) = hz - magMean(2,0);
+         magM2(2,0) = magM2(2,0) + magDelta(2,0) * magDelta2(2,0);
+         if (magCount > 2){
+           magVariance(0,0) = magM2(0,0)/((float) (magCount-1));
+           magVariance(1,0) = magM2(1,0)/((float) (magCount-1));
+           magVariance(2,0) = magM2(2,0)/((float) (magCount-1));
+         }
+     }
+     if((accelUpdated_)&&(magUpdated_)){
+       quatCount++;
+       accel(0,0) = fx;
+       accel(1,0) = fy;
+       accel(2,0) = fz;
+       mag(0,0) = hx;
+       mag(1,0) = hy;
+       mag(2,0) = hz;
+       normalize(accel);
+       normalize(mag);
+       Euler(1,0) = asin(accel(0,0));
+       Euler(0,0) = asin(-accel(1,0)/(cos(Euler(1,0))));
+       Euler(2,0) = atan2(mag(2,0)*sin(Euler(0,0))-mag(1,0)*cos(Euler(0,0)),mag(0,0)*cos(Euler(1,0))+mag(1,0)*sin(Euler(1,0))*sin(Euler(0,0))+mag(2,0)*sin(Euler(1,0))*cos(Euler(0,0)));
+       Quat = Eul2Quat(Euler);
+       quatDelta(0,0) = Quat(0,0) - quatMean(0,0);
+       quatMean(0,0) = quatMean(0,0) + quatDelta(0,0) / ((float)quatCount);
+       quatDelta2(0,0) = Quat(0,0) - quatMean(0,0);
+       quatM2(0,0) = quatM2(0,0) + quatDelta(0,0) * quatDelta2(0,0);
+       quatDelta(1,0) = Quat(1,0) - quatMean(1,0);
+       quatMean(1,0) = quatMean(1,0) + quatDelta(1,0) / ((float)quatCount);
+       quatDelta2(1,0) = Quat(1,0) - quatMean(1,0);
+       quatM2(1,0) = quatM2(1,0) + quatDelta(1,0) * quatDelta2(1,0);
+       quatDelta(2,0) = Quat(2,0) - quatMean(2,0);
+       quatMean(2,0) = quatMean(2,0) + quatDelta(2,0) / ((float)quatCount);
+       quatDelta2(2,0) = Quat(2,0) - quatMean(2,0);
+       quatM2(2,0) = quatM2(2,0) + quatDelta(2,0) * quatDelta2(2,0);
+       quatDelta(3,0) = Quat(3,0) - quatMean(3,0);
+       quatMean(3,0) = quatMean(3,0) + quatDelta(3,0) / ((float)quatCount);
+       quatDelta2(3,0) = Quat(3,0) - quatMean(3,0);
+       quatM2(3,0) = quatM2(3,0) + quatDelta(3,0) * quatDelta2(3,0);
+       if (quatCount > 2) {
+          quatVariance(0,0) = quatM2(0,0)/((float)(quatCount-1));
+          quatVariance(1,0) = quatM2(1,0)/((float)(quatCount-1));
+          quatVariance(2,0) = quatM2(2,0)/((float)(quatCount-1));
+          quatVariance(3,0) = quatM2(3,0)/((float)(quatCount-1));
+     }
+   }
+ } else {
+   /* initialize state */
+      x_(0,0) = quatMean(0,0);
+      x_(1,0) = quatMean(1,0);
+      x_(2,0) = quatMean(2,0);
+      x_(3,0) = quatMean(3,0);
+      x_(4,0) = gyroBias(0,0);
+      x_(5,0) = gyroBias(1,0);
+      x_(6,0) = gyroBias(2,0);
+      Quat(0,0) = x_(0,0);
+      Quat(1,0) = x_(1,0);
+      Quat(2,0) = x_(2,0);
+      Quat(3,0) = x_(3,0);
+      normalized(Quat);
+      initialEuler = Quat2Eul(Quat);
+      /* initialize process covariance */
+      P_(0,0) = quatVariance(0,0);
+      P_(1,1) = quatVariance(1,0);
+      P_(2,2) = quatVariance(2,0);
+      P_(3,3) = quatVariance(3,0);
+      P_(4,4) = gyroVariance(0,0);
+      P_(5,5) = gyroVariance(1,0);
+      P_(6,6) = gyroVariance(2,0);
+
+      /* initialize gyro covariance matrix */
+      Q_(0,0) = gyroVariance(0,0);
+      Q_(1,1) = gyroVariance(1,0);
+      Q_(2,2) = gyroVariance(2,0);
+
+      /* initialize measurement covariance matrix */
+      R_(0,0) = accelVariance(0,0);
+      R_(1,1) = accelVariance(1,0);
+      R_(2,2) = accelVariance(2,0);
+      R_(3,3) = magVariance(0,0);
+      R_(4,4) = magVariance(1,0);
+      R_(5,5) = magVariance(2,0);
+
+      Ra_(0,0) = accelVariance(0,0);
+      Ra_(1,1) = accelVariance(1,0);
+      Ra_(2,2) = accelVariance(2,0);
+
+      /* initialize output matrix */
+      M_.Fill(0);
+      Ma_.Fill(0);
+      M_(0,0) = 1;
+      M_(1,1) = 1;
+      M_(2,2) = 1;
+      M_(3,3) = 1;
+      Ma_(0,0) = 1;
+      Ma_(1,1) = 1;
+      Ma_(2,2) = 1;
+
+      /* initialize the time */
+      tprev = (float) micros()/1000000.0;
+
+      /* initialization complete */
+      initialized = true;
+    }
+ } else {
+   if (gyroUpdated_){
+     tnow = (float) micros() / 1000000.0;
+     dt = tnow - tprev;
+     tprev = tnow;
+      // state transition matrix
+      F_(0,0) = 1.0;                   F_(0,1) = -0.5*dt*(wx-x_(4,0));  F_(0,2) = -0.5*dt*(wy-x_(5,0));  F_(0,3) = -0.5*dt*(wz-x_(6,0));  
+      F_(1,0) = 0.5*dt*(wx-x_(4,0));   F_(1,1) = 1.0;                   F_(1,2) = 0.5*dt*(wz-x_(6,0));   F_(1,3) = -0.5*dt*(wy-x_(5,0));                    
+      F_(2,0) = 0.5*dt*(wy-x_(5,0));   F_(2,1) = -0.5*dt*(wz-x_(6,0));  F_(2,2) = 1.0;                   F_(2,3) = 0.5*dt*(wx-x_(4,0));
+      F_(3,0) = 0.5*dt*(wz-x_(6,0));   F_(3,1) = 0.5*dt*(wy-x_(5,0));   F_(3,2) = -0.5*dt*(wx-x_(4,0));  F_(3,3) = 1.0;
+      F_(0,4) = 0.5*dt*x_(1,0);        F_(0,5) = 0.5*dt*x_(2,0);        F_(0,6) = 0.5*dt*x_(3,0);
+      F_(1,4) = -0.5*dt*x_(0,0);       F_(1,5) = -0.5*dt*x_(2,0);       F_(1,6) = 0.5*dt*x_(3,0);
+      F_(2,4) = -0.5*dt*x_(3,0);       F_(2,5) = -0.5*dt*x_(0,0);       F_(2,6) = 0.5*dt*x_(1,0);
+      F_(3,4) = 0.5*dt*x_(2,0);        F_(3,5) = -0.5*dt*x_(1,0);       F_(3,6) = 0.5*dt*x_(0,0);
+      F_(4,4) = 1.0;                   F_(5,5) = 1.0;                   F_(6,6) = 1.0;
+      // process noise matrix
+      L_(0,0) = -0.5*dt*x_(1,0);   L_(0,1) = -0.5*dt*x_(2,0);   L_(0,2) = -0.5*dt*x_(3,0);
+      L_(1,0) = 0.5*dt*x_(0,0);    L_(1,1) = -0.5*dt*x_(3,0);   L_(1,2) = 0.5*dt*x_(2,0);
+      L_(2,0) = 0.5*dt*x_(3,0);    L_(2,1) = 0.5*dt*x_(0,0);    L_(2,2) = -0.5*dt*x_(1,0); 
+      L_(3,0) = -0.5*dt*x_(2,0);   L_(3,1) = 0.5*dt*x_(1,0);    L_(3,2) = 0.5*dt*x_(0,0);
+      L_(4,0) = 1.0;               L_(4,1) = 0.0;               L_(4,2) = 0.0;
+      L_(5,0) = 0.0;               L_(5,1) = 1.0;               L_(5,2) = 0.0;
+      L_(6,0) = 0.0;               L_(6,1) = 0.0;               L_(6,2) = 1.0;
+   //covariance
+      BLA::Matrix<7, 7> F_transposed = transposeMatrix(F_);
+      BLA::Matrix<3, 7> L_transposed = transposeMatrix(L_);
+      P_ = F_*P_*F_transposed + L_*Q_*L_transposed;
+      //state
+      x_ = F_*x_;
+
+      if ((accelUpdated_) && (magUpdated_)){
+        accel(0,0) = fx;
+        accel(1,0) = fy;
+        accel(2,0) = fz;
+        normalize(accel);
+        mag(0,0) = hx;
+        mag(1,0) = hy;
+        mag(2,0) = hz;
+        normalize(mag);
+        // measurement jacobian
+        H_(0,0) = 2.0*x_(2,0);  H_(0,1) = -2.0*x_(3,0);  H_(0,2) = 2.0*x_(0,0);   H_(0,3) = -2.0*x_(1,0);
+        H_(1,0) = -2.0*x_(1,0); H_(1,1) = -2.0*x_(0,0);  H_(1,2) = -2.0*x_(3,0);  H_(1,3) = -2.0*x_(2,0);
+        H_(2,0) = -2.0*x_(0,0); H_(2,1) = 2.0*x_(1,0);   H_(2,2) = 2.0*x_(2,0);   H_(2,3) = -2.0*x_(3,0);
+        H_(3,0) = (-4.0*x_(0,0)*x_(0,0)*x_(3,0)+4.0*x_(1,0)*x_(1,0)*x_(3,0)-2.0*x_(3,0)-8.0*x_(1,0)*x_(2,0)*x_(0,0))/(pow(2.0*x_(1,0)*x_(2,0)+2.0*x_(0,0)*x_(3,0),2.0)+pow((2.0*x_(1,0)*x_(1,0)+2.0*x_(0,0)*x_(0,0)-1.0),2.0));
+        H_(3,1) = (4.0*x_(2,0)*x_(0,0)*x_(0,0)-4.0*x_(1,0)*x_(1,0)*x_(2,0)-2.0*x_(2,0)-8.0*x_(1,0)*x_(0,0)*x_(3,0))/(pow(2.0*x_(1,0)*x_(2,0)+2.0*x_(0,0)*x_(3,0),2.0)+pow((2.0*x_(1,0)*x_(1,0)+2.0*x_(0,0)*x_(0,0)-1.0),2.0));
+        H_(3,2) = 2.0*x_(1,0)*(2.0*x_(1,0)*x_(1,0)+2.0*x_(0,0)*x_(0,0)-1.0)/(pow(2.0*x_(1,0)*x_(2,0)+2.0*x_(0,0)*x_(3,0),2.0)+pow((2.0*x_(1,0)*x_(1,0)+2.0*x_(0,0)*x_(0,0)-1.0),2.0));
+        H_(3,3) = 2.0*x_(0,0)*(2.0*x_(0,0)*x_(0,0)+2.0*x_(1,0)*x_(1,0)-1.0)/(pow(2.0*x_(1,0)*x_(2,0)+2.0*x_(0,0)*x_(3,0),2.0)+pow((2.0*x_(1,0)*x_(1,0)+2.0*x_(0,0)*x_(0,0)-1.0),2.0));
+        // noise jacobian
+        theta = asin(accel(0,0));
+        phi = asin(-accel(1,0)/(cos(theta)));
+        M_(3,3) = (-cos(theta)*(mag(2,0)*sin(phi)-mag(1,0)*cos(phi)))/(pow(mag(2,0)*sin(phi)-mag(1,0)*cos(phi),2.0)+pow(mag(0,0)*cos(theta)+mag(2,0)*cos(phi)*sin(theta)+mag(1,0)*sin(phi)*sin(theta),2.0));
+        M_(3,4) = (-mag(2,0)*cos(phi)*cos(phi)*sin(theta)-mag(0,0)*cos(theta)*cos(phi)-mag(2,0)*sin(phi)*sin(phi)*sin(theta))/(pow(mag(2,0)*sin(phi)-mag(1,0)*cos(phi),2.0)+pow(mag(0,0)*cos(theta)+mag(2,0)*cos(phi)*sin(theta)+mag(1,0)*sin(phi)*sin(theta),2.0));
+        M_(3,5) = (mag(0,0)*sin(phi)*cos(theta)+mag(1,0)*sin(phi)*sin(phi)*sin(theta)+mag(1,0)*cos(phi)*cos(phi)*sin(theta))/(pow(mag(2,0)*sin(phi)-mag(1,0)*cos(phi),2.0f)+pow(mag(0,0)*cos(theta)+mag(2,0)*cos(phi)*sin(theta)+mag(1,0)*sin(phi)*sin(theta),2.0));
+        //Kalman gain
+        BLA::Matrix<7, 4> H_transposed = transposeMatrix(H_); 
+        BLA::Matrix<6, 4> M_transposed = transposeMatrix(M_);
+        K_ = P_*H_transposed*Inverse(H_*P_*H_transposed + M_*R_*M_transposed);
+        // estimated output
+        h_(0,0) = -2.0*(x_(1,0)*x_(3,0)-x_(0,0)*x_(2,0));
+        h_(1,0) = -2.0*(x_(0,0)*x_(1,0)+x_(2,0)*x_(3,0));
+        h_(2,0) = -(x_(0,0)*x_(0,0)-x_(1,0)*x_(1,0)-x_(2,0)*x_(2,0)+x_(3,0)*x_(3,0));
+        h_(3,0) = atan2(2.0*x_(1,0)*x_(2,0)+2.0*x_(0,0)*x_(3,0),2.0*x_(0,0)*x_(0,0)+2.0*x_(1,0)*x_(1,0)-1.0);
+        // measured output
+        y_(0,0) = accel(0,0);
+        y_(1,0) = accel(1,0);
+        y_(2,0) = accel(2,0);
+        y_(3,0) = atan2(mag(2,0)*sin(phi)-mag(1,0)*cos(phi),mag(0,0)*cos(theta)+mag(1,0)*sin(theta)*sin(phi)+mag(2,0)*sin(theta)*cos(phi));
+        // state
+        x_ = x_ + K_*(y_-h_);
+        //covariance
+        I_.Fill(0);
+        I_(0,0) = 1;   I_(1,1) = 1;   I_(2,2) = 1;   I_(3,3) = 1;   I_(4,4) = 1;    I_(5,5) = 1;    I_(6,6) = 1;
+        P_ = (I_ - Ka_*Ha_)*P_;  
+      } else if (accelUpdated_){
+        accel(0,0) = fx;
+        accel(1,0) = fy;
+        accel(2,0) = fz;
+        normalize(accel);
+        // measurement jacobian
+        Ha_(0,0) = 2.0*x_(2,0);  Ha_(0,1) = -2.0*x_(3,0);  Ha_(0,2) = 2.0*x_(0,0);   Ha_(0,3) = -2.0*x_(1,0);
+        Ha_(1,0) = -2.0*x_(1,0); Ha_(1,1) = -2.0*x_(0,0);  Ha_(1,2) = -2.0*x_(3,0);  Ha_(1,3) = -2.0*x_(2,0);
+        Ha_(2,0) = -2.0*x_(0,0); Ha_(2,1) = 2.0*x_(1,0);   Ha_(2,2) = 2.0*x_(2,0);   Ha_(2,3) = -2.0*x_(3,0);
+        // kalman gain
+        BLA::Matrix<7, 3> Ha_transposed = transposeMatrix(Ha_);  
+        BLA::Matrix<3, 3> Ma_transposed = transposeMatrix(Ma_);
+        Ka_ = P_*Ha_transposed*Inverse(Ha_*P_*Ha_transposed+Ma_*Ra_*Ma_transposed);
+         // estimated output
+        ha_(0,0) = -2.0*(x_(1,0)*x_(3,0)-x_(0,0)*x_(2,0));
+        ha_(1,0) = -2.0*(x_(0,0)*x_(1,0)+x_(2,0)*x_(3,0));
+        ha_(2,0) = -(x_(0,0)*x_(0,0)-x_(1,0)*x_(1,0)-x_(2,0)*x_(2,0)+x_(3,0)*x_(3,0));
+        // measured output
+        ya_(0,0) = accel(0,0);
+        ya_(1,0) = accel(1,0);
+        ya_(2,0) = accel(2,0);
+        // state
+        x_ = x_ + Ka_*(ya_-ha_);
+        //covariance
+        I_.Fill(0);
+        I_(0,0) = 1;   I_(1,1) = 1;   I_(2,2) = 1;   I_(3,3) = 1;   I_(4,4) = 1;    I_(5,5) = 1;    I_(6,6) = 1;
+        P_ = (I_ - Ka_*Ha_)*P_;  
+      }
+        Quat(0,0) = x_(0,0);
+        Quat(1,0) = x_(1,0);
+        Quat(2,0) = x_(2,0);
+        Quat(3,0) = x_(3,0);
+        normalized(Quat);
+        Euler = Quat2Eul(Quat);   
+      }
+   }
+   if (initialized) {
+     return true;
+   } else {
+     return false;
+   }
+ }
+
+void setup()
+{
+  Serial.begin(115200);
+  Wire.begin();
+  if (!myISM.begin()){
+    Serial.println("Did not begin.");
+    while(1);
+  }
+  myISM.deviceReset();
+  while (!myISM.getDeviceReset()) {
+    delay(1);
+  }
+  myISM.setDeviceConfig();
+  myISM.setBlockDataUpdate();
+  myISM.setAccelDataRate(ISM_XL_ODR_104Hz);
+  myISM.setAccelFullScale(ISM_8g);
+  myISM.setGyroDataRate(ISM_GY_ODR_104Hz);
+  myISM.setGyroFullScale(ISM_250dps);
+  myISM.setAccelFilterLP2();
+  myISM.setAccelSlopeFilter(ISM_LP_ODR_DIV_100);
+  myISM.setGyroFilterLP1();
+  myISM.setGyroLP1Bandwidth(ISM_MEDIUM);
+
+  if (myMag.begin() == false)
+  {
+    Serial.println("MMC5983MA did not respond");
+    while(true);
+  }
+  myMag.softReset();
+  
+  ISM_setup();
+
+  if (SD.begin(chipselect)){
+    Serial.println("Sd card is ready!");
+  } else {
+    Serial.println("Sd card is not ready");
+}
+}
+void loop()
+{
+    tstart = micros();
+    ISM_calib();
+    BLA::Matrix<3, 1> f = Inverse(I + Ma)*(f_raw - ba);
+    BLA::Matrix<3,1> w = Inverse(I + Mw)*(Inverse(Rm)*w_raw - bw);
+    BLA::Matrix<3,1> h = Inverse(A)*(h_raw-bh);
+    float wx_dps = w(0,0)*convert_dps;
+    float wy_dps = w(1,0)*convert_dps;
+    float wz_dps = w(2,0)*convert_dps;
+    kalman_filter(wx_dps,wy_dps,wz_dps,f(0,0),f(1,0),f(2,0),h(0,0),h(1,0),h(2,0));
+
+
+    String data_array = ""; 
+    //data_array += String(wx_dps);
+    //data_array += " ";
+    //data_array += String(wy_dps);
+    //data_array += " ";
+    //data_array += String(wz_dps);
+    //data_array += " ";
+    //data_array += String(w(0,0),4);
+    //data_array += " ";
+    //data_array += String(w(1,0),4);
+    //data_array += " ";
+    //data_array += String(w(2,0),4);
+    //data_array += " ";
+    //data_array += String(h(0,0),4);
+    //data_array += " ";
+    //data_array += String(h(1,0),4);
+    //data_array += " ";
+    //data_array += String(h(2,0),4);
+    //data_array += " ";
+    //data_array += String(tstop - tstart);
+
+    Serial.println(data_array);
+
+    /*File myFile = SD.open("ISM.txt", FILE_WRITE);
+      if(myFile){
+      myFile.println(data_array);
+       myFile.close();
+      }else {
+        Serial.println("error opening ACCEL_LSM9DS1.txt");
+    }
+    */
+    delay(10);
+    
+}
+
+
+
